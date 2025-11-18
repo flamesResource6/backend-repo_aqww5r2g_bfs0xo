@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 
 from database import db, create_document, get_documents
 from pydantic import BaseModel, EmailStr
-from schemas import User, Product, Sale, SaleItem
+from schemas import User, Product, Sale, SaleItem, Settings
 
 # Security settings
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change")
@@ -49,6 +49,21 @@ class ProductCreate(BaseModel):
     stock: int = 0
     category: Optional[str] = None
     tax_rate: float = 0.0
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    price: Optional[float] = None
+    cost: Optional[float] = None
+    stock: Optional[int] = None
+    category: Optional[str] = None
+    tax_rate: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
+class StockAdjust(BaseModel):
+    barcode: str
+    delta: int
 
 
 class SaleRequest(BaseModel):
@@ -184,6 +199,34 @@ def create_product(product: ProductCreate, _: dict = Depends(get_current_user)):
     return {"status": "ok"}
 
 
+@app.put("/products/{barcode}")
+def update_product(barcode: str, update: ProductUpdate, _: dict = Depends(get_current_user)):
+    doc = db.product.find_one({"barcode": barcode})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Product not found")
+    update_dict = {k: v for k, v in update.model_dump(exclude_none=True).items()}
+    if not update_dict:
+        return {"status": "ok"}
+    db.product.update_one({"barcode": barcode}, {"$set": update_dict, "$currentDate": {"updated_at": True}})
+    return {"status": "ok"}
+
+
+@app.delete("/products/{barcode}")
+def delete_product(barcode: str, _: dict = Depends(get_current_user)):
+    res = db.product.delete_one({"barcode": barcode})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"status": "ok"}
+
+
+@app.post("/products/adjust-stock")
+def adjust_stock(req: StockAdjust, _: dict = Depends(get_current_user)):
+    res = db.product.update_one({"barcode": req.barcode}, {"$inc": {"stock": req.delta}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"status": "ok"}
+
+
 @app.get("/products/by-barcode/{barcode}")
 def get_product_by_barcode(barcode: str, _: dict = Depends(get_current_user)):
     docs = get_documents("product", {"barcode": barcode}, limit=1)
@@ -252,6 +295,106 @@ def sales_summary(_: dict = Depends(get_current_user)):
     except Exception:
         pass
     return {"today_total": 0, "transactions": 0, "items_sold": 0}
+
+
+# Advanced reports
+@app.get("/sales/range-summary")
+def range_summary(start: Optional[str] = None, end: Optional[str] = None, _: dict = Depends(get_current_user)):
+    try:
+        if start:
+            start_dt = datetime.fromisoformat(start)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        else:
+            start_dt = datetime.now(timezone.utc) - timedelta(days=7)
+        if end:
+            end_dt = datetime.fromisoformat(end)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        else:
+            end_dt = datetime.now(timezone.utc)
+        pipeline = [
+            {"$match": {"created_at": {"$gte": start_dt, "$lte": end_dt}}},
+            {"$unwind": "$items"},
+            {"$group": {
+                "_id": None,
+                "revenue": {"$sum": "$total"},
+                "transactions": {"$addToSet": "$_id"},
+                "items_sold": {"$sum": "$items.quantity"},
+            }},
+            {"$project": {"_id": 0, "revenue": 1, "transactions": {"$size": "$transactions"}, "items_sold": 1}}
+        ]
+        res = list(db.sale.aggregate(pipeline))
+        if res:
+            return res[0]
+    except Exception:
+        pass
+    return {"revenue": 0, "transactions": 0, "items_sold": 0}
+
+
+@app.get("/sales/top-products")
+def top_products(days: int = 30, limit: int = 10, _: dict = Depends(get_current_user)):
+    try:
+        start_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        pipeline = [
+            {"$match": {"created_at": {"$gte": start_dt}}},
+            {"$unwind": "$items"},
+            {"$group": {"_id": "$items.barcode", "name": {"$first": "$items.name"}, "qty": {"$sum": "$items.quantity"}, "revenue": {"$sum": {"$multiply": ["$items.price", "$items.quantity"]}}}},
+            {"$sort": {"qty": -1}},
+            {"$limit": limit},
+            {"$project": {"barcode": "$_id", "_id": 0, "name": 1, "qty": 1, "revenue": 1}}
+        ]
+        return list(db.sale.aggregate(pipeline))
+    except Exception:
+        return []
+
+
+@app.get("/sales/export")
+def export_sales(start: Optional[str] = None, end: Optional[str] = None, _: dict = Depends(get_current_user)):
+    import csv
+    from io import StringIO
+    try:
+        if start:
+            start_dt = datetime.fromisoformat(start)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        else:
+            start_dt = datetime.now(timezone.utc) - timedelta(days=7)
+        if end:
+            end_dt = datetime.fromisoformat(end)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        else:
+            end_dt = datetime.now(timezone.utc)
+
+        cursor = db.sale.find({"created_at": {"$gte": start_dt, "$lte": end_dt}})
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["_id", "created_at", "subtotal", "tax_total", "total", "paid_amount", "change", "payment_method", "items_count"])
+        for s in cursor:
+            writer.writerow([
+                str(s.get("_id")), s.get("created_at"), s.get("subtotal"), s.get("tax_total"), s.get("total"), s.get("paid_amount"), s.get("change"), s.get("payment_method"), len(s.get("items", []))
+            ])
+        return output.getvalue()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Settings
+@app.get("/settings")
+def get_settings(_: dict = Depends(get_current_user)):
+    doc = db.settings.find_one({})
+    if not doc:
+        default = Settings()
+        return default.model_dump()
+    doc.pop("_id", None)
+    return doc
+
+
+@app.put("/settings")
+def update_settings(s: Settings, _: dict = Depends(get_current_user)):
+    db.settings.update_one({}, {"$set": s.model_dump(), "$currentDate": {"updated_at": True}}, upsert=True)
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

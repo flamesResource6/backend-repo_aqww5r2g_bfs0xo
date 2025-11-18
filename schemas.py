@@ -46,3 +46,11 @@ class Sale(BaseModel):
     change: float
     payment_method: str = "cash"  # cash, card, mobile
     created_at: Optional[datetime] = None
+
+
+class Settings(BaseModel):
+    company_name: str = "My Store"
+    currency: str = "USD"
+    tax_rate_default: float = 0.0
+    enable_gamified_sounds: bool = True
+    theme: str = "indigo"  # theme hint for UI
