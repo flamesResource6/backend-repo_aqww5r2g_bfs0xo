@@ -1,8 +1,26 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+from database import db, create_document, get_documents
+from pydantic import BaseModel, EmailStr
+from schemas import User, Product, Sale, SaleItem
+
+# Security settings
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+app = FastAPI(title="Supermarket POS API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,57 +30,228 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Utility helpers
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+
+class ProductCreate(BaseModel):
+    barcode: str
+    name: str
+    price: float
+    cost: float = 0
+    stock: int = 0
+    category: Optional[str] = None
+    tax_rate: float = 0.0
+
+
+class SaleRequest(BaseModel):
+    items: List[SaleItem]
+    paid_amount: float
+    payment_method: str = "cash"
+
+
+class AuthRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# Auth helpers
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user_docs = get_documents("user", {"email": email}, limit=1)
+    if not user_docs:
+        raise credentials_exception
+    return user_docs[0]
+
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Supermarket POS API"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
+    info = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
+        "database_url": "❌ Not Set",
+        "database_name": "❌ Not Set",
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            info["database"] = "✅ Connected & Working"
+            info["database_url"] = "✅ Set"
+            info["database_name"] = db.name
+            info["connection_status"] = "Connected"
+            info["collections"] = db.list_collection_names()
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+        info["database"] = f"⚠️ Error: {str(e)[:80]}"
+    return info
+
+
+# Helper to accept either JSON or form for legacy compatibility
+async def parse_auth_request(request: Request) -> AuthRequest:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        data = await request.json()
+        return AuthRequest(**data)
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        email = (form.get("username") or form.get("email") or "").lower()
+        password = form.get("password") or ""
+        return AuthRequest(email=email, password=password)
+    else:
+        data = await request.json()
+        return AuthRequest(**data)
+
+
+# Auth routes
+@app.post("/auth/register", response_model=Token)
+async def register(request: Request):
+    auth = await parse_auth_request(request)
+
+    existing = get_documents("user", {"email": auth.email}, limit=1)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = User(email=auth.email, name=auth.email.split("@")[0], password_hash=get_password_hash(auth.password))
+    create_document("user", user)
+
+    token = create_access_token({"sub": user.email})
+    return Token(access_token=token)
+
+
+@app.post("/auth/token", response_model=Token)
+async def login(request: Request):
+    auth = await parse_auth_request(request)
+
+    user_docs = get_documents("user", {"email": auth.email}, limit=1)
+    if not user_docs:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = user_docs[0]
+    if not verify_password(auth.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": auth.email})
+    return Token(access_token=token)
+
+
+# Products
+@app.post("/products")
+def create_product(product: ProductCreate, _: dict = Depends(get_current_user)):
+    existing = get_documents("product", {"barcode": product.barcode}, limit=1)
+    if existing:
+        raise HTTPException(status_code=400, detail="Barcode already exists")
+    create_document("product", Product(**product.model_dump()))
+    return {"status": "ok"}
+
+
+@app.get("/products/by-barcode/{barcode}")
+def get_product_by_barcode(barcode: str, _: dict = Depends(get_current_user)):
+    docs = get_documents("product", {"barcode": barcode}, limit=1)
+    if not docs:
+        raise HTTPException(status_code=404, detail="Product not found")
+    doc = docs[0]
+    doc["_id"] = str(doc.get("_id"))
+    return doc
+
+
+@app.get("/products", response_model=list)
+def list_products(_: dict = Depends(get_current_user)):
+    docs = get_documents("product", {})
+    for d in docs:
+        d["_id"] = str(d.get("_id"))
+    return docs
+
+
+# Sales
+@app.post("/sales")
+def create_sale(req: SaleRequest, user: dict = Depends(get_current_user)):
+    # Compute totals server-side
+    subtotal = sum(item.price * item.quantity for item in req.items)
+    tax_total = sum((item.price * item.quantity) * item.tax_rate for item in req.items)
+    total = subtotal + tax_total
+
+    sale = Sale(
+        user_id=str(user.get("_id")),
+        items=req.items,
+        subtotal=subtotal,
+        tax_total=tax_total,
+        total=total,
+        paid_amount=req.paid_amount,
+        change=max(0.0, req.paid_amount - total),
+        payment_method=req.payment_method,
+        created_at=datetime.now(timezone.utc)
+    )
+    create_document("sale", sale)
+
+    # Decrement stock
+    try:
+        for item in req.items:
+            db.product.update_one({"barcode": item.barcode}, {"$inc": {"stock": -item.quantity}})
+    except Exception:
+        pass
+
+    return {"status": "ok", "total": total}
+
+
+@app.get("/sales/summary")
+def sales_summary(_: dict = Depends(get_current_user)):
+    # Simple aggregation summaries
+    try:
+        today = datetime.now().date()
+        start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+        end = datetime.combine(today, datetime.max.time(), tzinfo=timezone.utc)
+
+        pipeline = [
+            {"$match": {"created_at": {"$gte": start, "$lte": end}}},
+            {"$group": {"_id": None, "total": {"$sum": "$total"}, "txns": {"$count": {}}, "items": {"$sum": {"$size": "$items"}}}}
+        ]
+        res = list(db.sale.aggregate(pipeline))
+        if res:
+            s = res[0]
+            return {"today_total": s.get("total", 0), "transactions": s.get("txns", 0), "items_sold": s.get("items", 0)}
+    except Exception:
+        pass
+    return {"today_total": 0, "transactions": 0, "items_sold": 0}
 
 
 if __name__ == "__main__":
